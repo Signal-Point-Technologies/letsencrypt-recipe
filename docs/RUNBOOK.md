@@ -360,6 +360,42 @@ The daily runner is `07-Renew-And-Deploy.ps1`; what it does, its inventory modes
 | Built-in `EasyDNS` plugin writes challenges into a nonexistent zone | `EasyDNSFix` in every issuance; `08` checks each order's plugin | Re-issue with `-Plugin EasyDNSFix` |
 | DNS creds swapped / stale / rate-limited (identical 420 over HTTP 200) | `02` live-verifies and auto-corrects; plugin paces calls; one issuance at a time | Re-run `02` with the current pair; wait out rate limits |
 | Renewal task runs as the wrong account and renews nothing | `-TaskUser` = the account that ran `02`; first-run smoke test | Re-register the task |
+| Two orchestrators running at once during a migration | Disable the old task before enabling the new one | Re-enable the old task; disable the new |
+
+---
+
+## Moving the orchestrator (new machine or new service account)
+
+Use this when the orchestrator box is retired, or the automation must run as a different user. **Rebuild; don't copy the profile.** The scripts are plain files, but the state that matters is bound to one Windows user on one machine.
+
+| Item | Lives in | Moves? |
+| --- | --- | --- |
+| Scripts, `EasyDNSFix.ps1`, `CertHosts.ps1` | Service account's working folder | Copy (or clone this repo + your `CertHosts.ps1`) |
+| Vault secrets (DNS token/key, WinRM push credentials) | SecretStore in the service account's profile | **No** — encrypted to that user and machine. Re-enter |
+| LE account, orders, certs | `%LOCALAPPDATA%\Posh-ACME` (service account) | Possible, but a fresh account + reissue is cleaner |
+| Scheduled task | Task Scheduler | Recreate with `04` |
+| SSH keys to Linux hosts | `~\.ssh` (service account) | Generate new |
+| The orchestrator's **own** IIS site, if it was a local deploy target | `05` + `06` local hook | Change its `CertHosts` entry |
+
+Hosts that self-manage (acme.sh on Linux, appliance-native ACME) are not affected. Remote Windows targets only need their push credential re-entered.
+
+**Procedure:**
+
+1. **New box:** Windows Server with pwsh 7 and network reach to every push target (WinRM 5985/5986, appliance APIs). Create a dedicated service account.
+2. **As admin:** copy `scripts\` and your `CertHosts.ps1`; run `01-Install-Prereqs.ps1`.
+3. **As the service account (pwsh 7):** `02-Setup-Vault-Account.ps1 -ContactEmail <you> -VerifyZone <zone>` (re-enter the DNS API pair from the provider portal; it verifies live), then add each push credential, e.g. `Set-Secret <Host>-Cred (Get-Credential)`.
+4. **Gate:** `03-Test-StagingCert.ps1 -Hosts <names>` must pass.
+5. **Fix `CertHosts.ps1`:** if the old orchestrator served a site itself, change that entry to a remote store push (if the site moves) or comment it out (if it is retired).
+6. **Cut over — one issuer only:**
+   1. Old box: **disable** (don't delete) the scheduled task.
+   2. New box: `04-Register-RenewalTask.ps1 -TaskUser <svc>`, then start the task once by hand.
+   3. Check the log's `RESULT:` line, `last-run.json`, and every host's served expiry.
+   - The first run reissues every name. That's inside LE limits (5 duplicates/week per exact name set; 50 certs/week per registered domain), but `-MaxIssuePerRun 2` spreads it over several nights.
+7. **Linux hosts** (only if the orchestrator needs SSH, e.g. to push rotated DNS creds): new key with `ssh-keygen -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"` (**pwsh 7: `''`, not `'""'`**, which becomes a literal two-character passphrase), add it to the host's `authorized_keys` (`restorecon -R ~/.ssh` on SELinux), and **remove the old orchestrator's key line**.
+8. **Parallel week:** keep the old box's task disabled but present for 7 days. Once the new box is green, decommission the old one: delete its Posh-ACME folder and vault.
+9. **Repoint monitoring** (failure event + stale `last-run.json`) at the new box, and update your as-built.
+
+> Never let two orchestrators run at the same time. They issue the same names, burn the duplicate-certificate limit, and their vaults drift apart.
 
 ---
 

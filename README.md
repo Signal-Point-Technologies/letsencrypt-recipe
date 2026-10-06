@@ -28,7 +28,7 @@ scripts/
   CertHosts.example.ps1         inventory template -> copy to CertHosts.ps1 (git-ignored)
   EasyDNSFix.ps1                corrected Posh-ACME DNS plugin for easyDNS
 docs/
-  RUNBOOK.md                    phased rollout plan, per-platform deploy patterns, rollback, verification
+  RUNBOOK.md                    phased rollout plan, per-platform deploy patterns, rollback, verification, moving the orchestrator
   MS-TUNNEL-GATEWAY.md          Microsoft Tunnel Gateway on Linux: acme.sh + mst-cli, tested step by step
 ```
 
