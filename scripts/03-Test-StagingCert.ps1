@@ -1,4 +1,4 @@
-# letsencrypt-recipe - https://github.com/acohen-lanconnectsystems/letsencrypt-recipe
+# letsencrypt-recipe - https://github.com/Signal-Point-Technologies/letsencrypt-recipe
 # Author : Andrew Cohen, Signal Point Technologies
 # License: MIT
 <#

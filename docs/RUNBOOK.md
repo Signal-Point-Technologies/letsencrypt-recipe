@@ -194,23 +194,61 @@ The cert and its private key now sit in the target's `LocalMachine\My`. Nothing 
 
 **4.1 - SAN set.** Check the history of certs the host has used (`Get-ExchangeCertificate | fl Subject, CertificateDomains`) and keep only the names something actually uses. Each extra SAN is another DNS-01 challenge that can fail unattended. Do not add `autodiscover.*` unless DNS actually points it at this host.
 
-**4.2 - Store push (automated).** Pattern 3 in `CertHosts.ps1`. Prove with `-ForceDeploy mail.example.com`. Mail flow is untouched: nothing is enabled.
+**4.2 - Store push (automated).** Pattern 3 in `CertHosts.ps1` with `ExchangeBind = $false`. Prove with `-ForceDeploy mail.example.com`. Mail flow is untouched: nothing is enabled, and every run logs a `PARTIAL` notice.
 
-**4.3 - Enable (manual, in the window).** On the Exchange box:
+**4.3 - Pre-checks (on the Exchange box).**
+
+- Revocation: `certutil -urlfetch -verify <exported .cer>` must fetch the CRL over the network. LE is CRL-only (no OCSP). A firewall captive portal intercepting plain-HTTP egress returns a login page instead of the CRL and Exchange marks the cert `RevocationCheckFailure`. AIA lines saying "Verified" come from the local cache and prove nothing about egress.
+- Connectors: `Get-ReceiveConnector -Server <SERVER> | ? Bindings -match ':25' | fl Identity,Fqdn,AuthMechanism,RemoteIPRanges,TlsCertificateName`. Every `:25` connector that can answer a TLS client must be pinned in 4.4 (a custom relay connector with internal `RemoteIPRanges` wins over Default Frontend for internal senders).
+- Hybrid: `Get-HybridConfiguration | fl TlsCertificateName` - note it; it must be updated in 4.4 too.
+
+**4.4 - First bind + re-pin (manual, in the window).** On the Exchange box, Windows PowerShell 5.1:
 
 ```powershell
-Enable-ExchangeCertificate -Thumbprint <tp> -Services IIS,SMTP   # add IMAP,POP only if in use
-Get-ExchangeCertificate -Thumbprint <tp> | Format-List Services,NotAfter,Subject
+.\09-Bind-ExchangeCert.ps1 -Domain mail.example.com -RequiredNames mail.example.com,smtp.example.com -WhatIf
+.\09-Bind-ExchangeCert.ps1 -Domain mail.example.com -RequiredNames mail.example.com,smtp.example.com
+# 09 prints the previously-bound thumbprints - keep them for rollback.
+
+$c   = Get-Item Cert:\LocalMachine\My\<tp>
+$pin = "<I>$($c.Issuer)<S>$($c.Subject)"      # built from the cert, never typed
+foreach ($rc in 'Default Frontend <SERVER>', '<internal relay connector>') {
+    (Get-ReceiveConnector "<SERVER>\$rc").TlsCertificateName | Add-Content C:\Temp\rc-pin-history.txt
+    Set-ReceiveConnector "<SERVER>\$rc" -TlsCertificateName $pin
+}
+Restart-Service MSExchangeFrontEndTransport
+Set-HybridConfiguration -TlsCertificateName $pin   # hybrid only
 ```
 
-**Verify:** OWA/ECP load over HTTPS with the new cert; send and receive a test message; `openssl s_client -connect <host>:443` and `openssl s_client -starttls smtp -connect <host>:25` both show the new cert.
-**Rollback:** `Enable-ExchangeCertificate -Thumbprint <old-tp> -Services IIS,SMTP`.
+Why a pin and not name-based selection: `Set-ReceiveConnector "Default Frontend <SERVER>" -Fqdn mail.example.com` is refused (`InvalidFqdnUnderExchangeServerAuthException`) because `AuthMechanism` includes `ExchangeServer`. With the `Fqdn` stuck on the server name, **clearing** the pin makes Exchange select the self-signed server cert for port 25.
+
+**4.5 - Automate.** Once 4.4 is verified, set `ExchangeBind = $true` (and `ExchangeConnectors` if there is more than Default Frontend) in the `CertHosts.ps1` entry. From then on every renewal runs `Invoke-ExchangeBind` from the orchestrator: revocation pre-check on the box (fail closed), bind, re-pin from the new cert's real issuer (so CA intermediate rotation cannot strand the pin), restart FrontEndTransport, verify 443 + 25/STARTTLS by thumbprint.
+
+**Verify:** OWA/ECP load over HTTPS with the new cert; send and receive a test message (internal and external); `openssl s_client -connect <host>:443` and `openssl s_client -starttls smtp -connect <host>:25` both show the new cert; no event 12014 in the Application log; `Get-Queue` shows nothing stuck in Retry.
+**Rollback:** `Enable-ExchangeCertificate -Thumbprint <old-tp> -Services IIS,SMTP -Force` (or `09 -Thumbprint <old-tp>`), then restore each connector's pin from `C:\Temp\rc-pin-history.txt` and restart `MSExchangeFrontEndTransport`.
+
+### Phase 4 lessons and troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Event 12014 (FrontEndTransport), no STARTTLS on 25 | `TlsCertificateName` pin names an issuer that no longer matches (CA rotated its intermediate - happened with a commercial CA) | rebuild the pin from the live cert; `ExchangeBind` does it every renewal |
+| Internet sees the self-signed server cert on 25 | pin cleared while `Fqdn` is still the server name | re-pin; do not clear |
+| Internal probe / relays get self-signed, external is fine | a custom `:25` connector with internal `RemoteIPRanges` is unpinned | add it to `ExchangeConnectors` and pin it |
+| `Status: RevocationCheckFailure` | server cannot fetch the CRL over plain HTTP | allow HTTP egress to the CRL host; check from the server itself |
+| `Services` / `CertificateDomains` missing from output | Exchange remote PowerShell (incl. local EMS) drops them | verify on the wire, or `Get-Item Cert:\LocalMachine\My\<tp>` |
+| `ADInvalidCredentialException` loading the snap-in | snap-in inside `Enter-PSSession` = Kerberos double hop | use `New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri http://<server>/PowerShell/`, or a local logon |
+| Events 12017 / 12018 "will expire soon" | 90-day certs trip the warning threshold | benign |
+| Queue Viewer crashes "Failed to enable constraints" | MMC bug | `Get-Queue`; `Get-Message -Filter "Status -eq 'Retry'"` |
+| Pin re-appears stale after the HCW | `Get-HybridConfiguration` `TlsCertificateName` still old | `Set-HybridConfiguration -TlsCertificateName <pin>` after any cert change |
+
+Never rebind IIS port 444 (Exchange Back End, keeps the self-signed cert) or 8172 (WMSvc); `Enable-ExchangeCertificate -Services IIS` only touches Default Web Site.
 
 ---
 
 ## Phase 5 - Firewall / VPN appliance (REST API)
 
 **Purpose:** prove issue -> API import -> bind -> reload on the highest-value target. On an HA pair, operate on the primary only; config syncs to the standby.
+
+> **Check for native ACME first.** Recent firmware on many appliances (FortiOS included) has a built-in ACME client. If it does, let the box issue and renew its own cert and keep only a commented-out `CertHosts.ps1` entry with the reason - never also issue the name from the orchestrator (duplicate-certificate limit, 5 per week). Native ACME usually uses HTTP-01, so port 80 must reach the box; monitor its expiry externally since the orchestrator no longer sees it. The REST-push procedure below is for appliances without native ACME.
 
 **5.1 - Issue** (pattern 4 in `CertHosts.ps1` until the hook exists): `.\07-Renew-And-Deploy.ps1 -IssueOnly vpn1.example.net`. Files land under `$env:LOCALAPPDATA\Posh-ACME\<server>\<account>\<fqdn>\` (`Get-PACertificate <fqdn> | fl *File*`).
 
@@ -254,12 +292,12 @@ export EASYDNS_Token='<token>'; export EASYDNS_Key='<key>'
   --reloadcmd      "sudo systemctl reload <service>"
 ```
 
-This host shares the DNS account's daily API budget with the orchestrator.
+This host shares the DNS account's daily API budget with the orchestrator. acme.sh's `dns_easydns` hook is a different implementation from Posh-ACME's built-in plugin and is not known to have its zone-detection bug, so `EasyDNSFix` applies to the Windows path only - but still run the staging issue first. Use RSA-2048 (`--keylength 2048`) if older clients must connect. Schedule the first cutover in a quiet window if the reload drops sessions.
 
 **Verify:** the service reports healthy; `openssl s_client` shows the LE issuer; `~/.acme.sh/acme.sh --list` shows the cron-driven renewal.
 **Rollback:** restore the previous `site.crt`/`site.key` from backup and reload.
 
-> If the "Linux host" turns out to be a **vendor-managed appliance** whose certificate the vendor issues (cloud tunnel gateways, for example), exclude it entirely and leave a commented-out entry with the reason.
+> If the "Linux host" turns out to be a **vendor-managed appliance** whose certificate the vendor really issues, exclude it entirely and leave a commented-out entry with the reason. Check the product docs before assuming: Microsoft Tunnel Gateway, for example, uses an **admin-supplied** PEM loaded with `mst-cli import_cert`, so acme.sh on the box is the right pattern for it. **Full tested procedure and gotchas: [`MS-TUNNEL-GATEWAY.md`](MS-TUNNEL-GATEWAY.md)**. In short: a leftover `site.pfx` takes priority over the PEM pair, `import_cert` exits 0 on failure, and the reload hook must be `printf '\n' | mst-cli import_cert && mst-cli server restart`.
 
 ---
 
@@ -311,7 +349,9 @@ The daily runner is `07-Renew-And-Deploy.ps1`; what it does, its inventory modes
 | --- | --- | --- |
 | A zone's DNS provider has no usable API | CNAME-delegate `_acme-challenge.<host>` to an automatable zone (one-time) | n/a (discovery) |
 | New cert breaks admin/VPN access on an appliance | Import alongside, switch, verify in a held session before removing the old | Re-point bindings to the prior cert |
-| Exchange swap disrupts mail flow | Windowed change; test send/receive and OWA before closing | `Enable-ExchangeCertificate` previous thumbprint |
+| Exchange swap disrupts mail flow | Windowed change; revocation pre-check on the box; pin every `:25` connector; test send/receive and OWA before closing | `Enable-ExchangeCertificate` previous thumbprint; restore pins from `C:\Temp\rc-pin-history.txt` |
+| Stale Exchange `TlsCertificateName` pin after CA intermediate rotation (12014) | Pin rebuilt from the live cert on every bind (`ExchangeBind`); hybrid config updated too | Re-pin from the current cert |
+| SAN edit silently never applied | `07` reissues when cert SANs differ from `Names` | `-WhatIfIssue`, then let the run reissue |
 | Auth login breaks after an IIS cert swap | Validate a real login per host | Re-bind previous thumbprint; review SNI/host headers |
 | Appliance has no automation path | API spike; fall back to auto-issue + alert + manual upload | Re-upload previous cert |
 | Silent deploy failure leaves an expiring cert | External expiry probe; `07` fails a renewed domain with no deploy hook | Manual re-issue/deploy; fix the hook |
@@ -337,6 +377,8 @@ openssl s_client -connect <host>:443 -servername <fqdn> </dev/null 2>/dev/null \
 - [ ] `.\07-Renew-And-Deploy.ps1 -WhatIfIssue` reports nothing to issue
 - [ ] Each host serves the LE cert end to end (and completes a real login where auth is involved)
 - [ ] Remote-push credentials stored in the vault and `Test-WSMan` passes for every push target
+- [ ] Exchange: 443 **and** 25/STARTTLS serve the new thumbprint (from outside and from an internal host); no event 12014; hybrid `TlsCertificateName` updated
+- [ ] Appliances on native ACME / acme.sh have an external expiry probe and no orchestrator entry
 - [ ] Scheduled task enabled, runs `07`, smoke-tested
 - [ ] Monitoring alerts on `RESULT: FAILED` **and** on a stale `last-run.json`; external expiry probe live
 - [ ] Previous certs removed only **after** their replacement is verified; cert entries only, never keys

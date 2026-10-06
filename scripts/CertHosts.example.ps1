@@ -1,4 +1,4 @@
-# letsencrypt-recipe - https://github.com/acohen-lanconnectsystems/letsencrypt-recipe
+# letsencrypt-recipe - https://github.com/Signal-Point-Technologies/letsencrypt-recipe
 # Author : Andrew Cohen, Signal Point Technologies
 # License: MIT
 <#
@@ -33,11 +33,21 @@
                  Tried in order, so a shared fallback works:
                    Set-Secret -Name Web02-Cred -Secret (Get-Credential)
                    Set-Secret -Name WinRM-Cred -Secret (Get-Credential)
+   ExchangeBind  (Exchange only) $true = after the push, bind the cert
+                 for IIS,SMTP and re-pin the receive connectors (see
+                 Invoke-ExchangeBind in 07). Default $false = store only.
+   ExchangeConnectors (Exchange only, optional) receive connector names
+                 to re-pin, without the 'SERVER' prefix. Default is
+                 'Default Frontend <SERVER>'. List EVERY :25 connector
+                 that can answer a TLS client (e.g. an internal relay
+                 connector with internal RemoteIPRanges).
 
  THINGS AVAILABLE INSIDE A Deploy SCRIPTBLOCK
    $PSScriptRoot            this folder (05/06 live here)
    $HostByDomain[<fqdn>]    this entry (lower-case key)
    Push-CertToRemoteStore   -Domain -Target -VaultSecretNames
+   Invoke-ExchangeBind      -Target -Thumbprint -Sni -VaultSecretNames
+                            [-ReceiveConnector <names>]
 
  Keep this file pure ASCII (no smart quotes / em-dashes) - Windows
  PowerShell 5.1 reads BOM-less UTF-8 as ANSI and chokes on them.
@@ -81,20 +91,40 @@ $CertHosts = @(
         }
     }
 
-    # ---- Pattern 3: Exchange - store push now, Enable-ExchangeCertificate by hand ----
-    # Multi-SAN example. Enabling the cert for IIS/SMTP is a change-window
-    # step; the push never touches the binding so mail flow is unaffected.
+    # ---- Pattern 3: Exchange - store push, then (opt-in) auto-bind ----
+    # Stage 1 (always): cert + key pushed into the Exchange server's store.
+    # Stage 2 (ExchangeBind = $true): Invoke-ExchangeBind - revocation
+    #   pre-check on the server, Enable-ExchangeCertificate -Services
+    #   IIS,SMTP by thumbprint, re-pin TlsCertificateName on each listed
+    #   receive connector, verify 443 + 25/STARTTLS on the wire.
+    # WHEN TO FLIP ExchangeBind TO $true: only after the FIRST bind + port-25
+    #   re-pin has been done and verified by hand (09-Bind-ExchangeCert.ps1,
+    #   runbook Exchange phase), the server's revocation check passes
+    #   (plain-HTTP egress to the CA's CRL host works), and any hybrid
+    #   Get-HybridConfiguration TlsCertificateName pin is updated. Until then
+    #   every run logs a PARTIAL notice so the manual step stays visible.
+    # PushSecrets must hold a DOMAIN account in Organization Management.
     @{
-        Domain      = 'mail.example.com'
-        Names       = @('mail.example.com', 'smtp.example.com')
-        DeployNote  = 'store-only push to exch01.example.com; Enable-ExchangeCertificate -Services IIS,SMTP is still manual'
-        PushTarget  = 'exch01.example.com'
-        PushSecrets = @('Exch01-Cred', 'WinRM-Cred')
+        Domain       = 'mail.example.com'
+        Names        = @('mail.example.com', 'smtp.example.com')
+        ExchangeBind = $false
+        # ExchangeConnectors = @('Default Frontend EXCH01', 'Internal Relay')
+        PushTarget   = 'exch01.corp.example.net'
+        PushSecrets  = @('Exch01-Cred', 'WinRM-Cred')
         Deploy = {
             param([string]$Domain)
             $e = $HostByDomain[$Domain.ToLower()]
-            Push-CertToRemoteStore -Domain $Domain -Target $e.PushTarget `
-                -VaultSecretNames $e.PushSecrets | Out-Null
+            $r = Push-CertToRemoteStore -Domain $Domain -Target $e.PushTarget `
+                    -VaultSecretNames $e.PushSecrets
+            if ($e.ExchangeBind) {
+                $bind = @{ Target = $e.PushTarget; Thumbprint = $r.Thumbprint; Sni = $Domain; VaultSecretNames = $e.PushSecrets }
+                if ($e.ExchangeConnectors) { $bind.ReceiveConnector = $e.ExchangeConnectors }
+                Invoke-ExchangeBind @bind
+            } else {
+                $n = "NOTICE: $Domain deploy is PARTIAL - store-only push to $($e.PushTarget); ExchangeBind is off (flip after the manual cutover)"
+                Log $n
+                $script:Status.Notices += $n
+            }
         }
     }
 
@@ -115,6 +145,11 @@ $CertHosts = @(
     }
 
     # ---- EXCLUDED BY DECISION - keep commented out WITH the reason ----
+    # vpn1.example.net (alt) - if the appliance has NATIVE ACME (e.g. FortiOS),
+    #   let it renew itself and never also issue the name here. Monitor its
+    #   expiry separately (native ACME usually needs HTTP-01 on port 80).
+    # tunnel.example.net (alt) - box runs acme.sh locally; same rule.
+    #   Microsoft Tunnel Gateway is this case - see docs/MS-TUNNEL-GATEWAY.md.
     # tunnel.example.net - managed appliance; the vendor issues its own cert.
     #   Two issuers for one name burn the LE duplicate-certificate limit.
     # @{ Domain='tunnel.example.net'; DeployPending='vendor-managed' }

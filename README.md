@@ -7,7 +7,7 @@ One box issues every cert, keeps the DNS API credentials in a DPAPI-bound vault,
 - **CA:** Let's Encrypt (staging first, then production)
 - **Challenge:** DNS-01 (no inbound ports; works for internal-only names)
 - **DNS provider:** easyDNS via the bundled `EasyDNSFix` plugin (the built-in Posh-ACME plugin is broken against easyDNS's API, see below)
-- **Targets:** local IIS, remote IIS / Exchange over WinRM (store push), anything else as "issue here, install by hand"
+- **Targets:** local IIS, remote IIS / Exchange over WinRM (store push, optional Exchange auto-bind), anything else as "issue here, install by hand"
 
 > Adapting to another DNS provider: swap `-Plugin EasyDNSFix` / the `EDToken`/`EDKey` args for the Posh-ACME plugin of your provider in scripts `03`, `07`, `08` and drop `EasyDNSFix.ps1`. Everything else is provider-neutral.
 
@@ -24,10 +24,12 @@ scripts/
   06-Bind-IISCert.ps1           point an IIS https binding at a thumbprint     (admin, on the web server)
   07-Renew-And-Deploy.ps1       THE daily runner: issue + renew + deploy + report
   08-AcmeDoctor.ps1             health check + repair
+  09-Bind-ExchangeCert.ps1      manual / rollback Exchange bind, run ON the Exchange box (5.1 + snap-in)
   CertHosts.example.ps1         inventory template -> copy to CertHosts.ps1 (git-ignored)
   EasyDNSFix.ps1                corrected Posh-ACME DNS plugin for easyDNS
 docs/
   RUNBOOK.md                    phased rollout plan, per-platform deploy patterns, rollback, verification
+  MS-TUNNEL-GATEWAY.md          Microsoft Tunnel Gateway on Linux: acme.sh + mst-cli, tested step by step
 ```
 
 ## Quick start (fresh orchestrator)
@@ -84,6 +86,7 @@ Get-Content C:\ProgramData\Posh-ACME-Renewal\renewal.log -Tail 30
 | `valid`, cert healthy | skip - `Submit-Renewal` owns it |
 | `valid`, cert missing on disk | reissue with `-Force` (without it Posh-ACME only warns) |
 | `valid`, cert expired | reissue |
+| `valid`, cert SANs differ from `Names` | reissue (`-Force`) with the new SAN set |
 
 Every attempt is **verified, not assumed**: afterwards the script confirms a cert exists, is not expired, and the order really reached `valid`. `New-PACertificate` returning nothing is a failure, never a silent success.
 
@@ -116,9 +119,21 @@ An entry with `PushTarget` + `PushSecrets` gets its full-chain PFX copied over W
 # As the SERVICE ACCOUNT, once:
 Set-Secret -Name Exch01-Cred -Secret (Get-Credential)   # local admin on the target
 Set-Secret -Name WinRM-Cred  -Secret (Get-Credential)   # or a shared fallback
-Test-WSMan exch01.example.com
+Test-WSMan exch01.corp.example.net
 .\07-Renew-And-Deploy.ps1 -ForceDeploy mail.example.com  # prove the push
 ```
+
+### Exchange auto-bind (`Invoke-ExchangeBind`, opt-in)
+
+The Exchange pattern in `CertHosts.example.ps1` pushes the cert, then - only when the entry has `ExchangeBind = $true` - binds it from the orchestrator:
+
+1. **Revocation pre-check on the Exchange box** (`Invoke-Command`, `X509Chain` with online revocation). Fails closed: if the box cannot fetch the CA's CRL, Exchange would mark the cert `RevocationCheckFailure`, so nothing is bound.
+2. **Probe** 443 and 25/STARTTLS; if both already serve the new thumbprint, stop (idempotent).
+3. `Enable-ExchangeCertificate -Services IIS,SMTP -Force` by thumbprint over the `Microsoft.Exchange` remote endpoint (`http://<server>/PowerShell/`, Kerberos). The credential must be a **domain** account in Organization Management.
+4. **Re-pin** `TlsCertificateName` (`<I>issuer<S>subject`, built from the new cert) on every connector in `ExchangeConnectors` (default `Default Frontend <SERVER>`), logging the old pin to `C:\Temp\rc-pin-history.txt` on the box, then restart `MSExchangeFrontEndTransport` once.
+5. **Re-probe** (up to 6 x 10 s). A mismatch throws with the rollback command.
+
+Leave `ExchangeBind = $false` (store push + `PARTIAL` notice every run) until the first bind and re-pin have been done and verified by hand with `09-Bind-ExchangeCert.ps1`. See the Exchange lessons below for why the pin exists at all.
 
 ## Self-repair, retries, and the circuit breaker
 
@@ -216,6 +231,29 @@ The doctor checks plugin registration, vault creds (live, with swap detection), 
 | Task runs but renews nothing | task user is not the account that ran `02` | re-register with the right `-TaskUser` |
 | `Keyset does not exist` after iisreset | an old cert was deleted **with** its shared key | `08 -Repair`, rebind, `iisreset`, verify externally |
 | Cert renewed but site serves the old one | renewal without the 05+06 deploy | ensure the task runs `07`; test with `-ForceDeploy` |
+| Added a SAN to `Names`, cert never changes | old runner skipped valid orders; `Submit-Renewal` renews the old name set | current `07` reissues on SAN mismatch; preview with `-WhatIfIssue` |
+| Exchange event 12014, no STARTTLS on 25 | stale `TlsCertificateName` pin (CA rotated its intermediate) | re-pin from the live cert's real issuer; `ExchangeBind` does this every renewal |
+| Exchange cert `RevocationCheckFailure` | box cannot fetch the CA CRL over plain HTTP (captive portal / proxy) | allow HTTP egress to the CRL host (e.g. `*.lencr.org`) from the server |
+
+## Lessons learned
+
+General:
+
+- **SAN edits need a reissue.** `Submit-Renewal` renews the name set the order was created with, forever. `07` now compares a valid cert's SANs against `Names` and reissues on mismatch. Preview with `-WhatIfIssue` - but note `-WhatIfIssue` still runs `Submit-Renewal`.
+- **Verify pushes by thumbprint, never by name.** A target can hold an older, longer-lived cert for the same name.
+- **One issuer per name.** Appliances with native ACME (e.g. FortiOS) and boxes running acme.sh locally should self-manage; never also issue the same name from the orchestrator (LE duplicate-certificate limit: 5 per week). Keep them as commented-out `CertHosts` entries and monitor their expiry separately - native ACME usually uses HTTP-01, so port 80 must reach the box.
+
+Exchange (details in `docs/RUNBOOK.md`, Phase 4):
+
+- The Default Frontend receive connector's `Fqdn` **cannot** be changed to the public name while `AuthMechanism` includes `ExchangeServer` (`InvalidFqdnUnderExchangeServerAuthException`), so name-based cert selection is impossible and port 25 needs a `TlsCertificateName` pin. Rebuild the pin from the new cert's real issuer on every renewal; a stale issuer string after a CA intermediate rotation means event 12014 and no STARTTLS.
+- **Clearing** a pin without changing `Fqdn` makes Exchange pick the self-signed server cert - the internet sees self-signed.
+- A custom `:25` receive connector with internal `RemoteIPRanges` (e.g. an internal relay connector) wins for internal clients, including your own probe. Pin it too, or verification fails falsely and internal relays get the self-signed cert.
+- Run the revocation check **on the Exchange box**. LE is CRL-only (no OCSP); a captive portal intercepting plain-HTTP egress breaks it, and `certutil` showing AIA "Verified" proves nothing about egress.
+- Exchange remote PowerShell (including locally launched EMS) drops `Services` / `CertificateDomains`; verify on the wire or via `Cert:\`. The snap-in inside `Enter-PSSession` fails with `ADInvalidCredentialException` (double hop); use the `Microsoft.Exchange` remote endpoint.
+- Benign after an LE swap: events 12017/12018 ("will expire soon" - 90-day certs trip it). Dangerous: 12014.
+- Never hand-type an issuer pin and forget it; never rebind IIS 444 (Exchange Back End) or 8172.
+- Hybrid: `Get-HybridConfiguration` `TlsCertificateName` can hold a stale pin that the HCW pushes back onto the connectors. Update it after any cert change.
+- Queue checks: `Get-Queue`, `Get-Message -Filter "Status -eq 'Retry'"`. Queue Viewer may crash with "Failed to enable constraints"; use the cmdlets.
 
 ## Credits and license
 

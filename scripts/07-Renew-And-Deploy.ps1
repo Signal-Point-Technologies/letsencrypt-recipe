@@ -1,4 +1,4 @@
-# letsencrypt-recipe - https://github.com/acohen-lanconnectsystems/letsencrypt-recipe
+# letsencrypt-recipe - https://github.com/Signal-Point-Technologies/letsencrypt-recipe
 # Author : Andrew Cohen, Signal Point Technologies
 # License: MIT
 <#
@@ -107,6 +107,22 @@
    the remote box and deleted in a finally block, pass or fail. The push
    never passes -RemoveSuperseded: the target may still be bound to the
    previous cert, and removing it would break that service.
+
+ EXCHANGE AUTO-BIND (Invoke-ExchangeBind, opt-in per entry)
+   An Exchange entry with ExchangeBind = $true goes one step further
+   after the push: revocation pre-check ON the Exchange server (fail
+   closed), Enable-ExchangeCertificate -Services IIS,SMTP by thumbprint
+   via the Microsoft.Exchange remote endpoint (Kerberos), re-pin of the
+   listed receive connectors' TlsCertificateName to the new cert's real
+   issuer/subject, then a TLS probe of 443 and 25/STARTTLS that must
+   return the new thumbprint. The credential must be a DOMAIN account in
+   Organization Management. See 09-Bind-ExchangeCert.ps1 for the manual
+   / rollback equivalent and docs/RUNBOOK.md for the lessons behind it.
+
+ SAN EDITS
+   Changing an entry's Names takes effect on the next run: a valid cert
+   whose SANs differ from Names is reissued (-Force). Preview with
+   -WhatIfIssue (note: -WhatIfIssue still runs Submit-Renewal).
 
  DELIBERATELY EXCLUDED HOSTS
    Keep them in CertHosts.ps1 as COMMENTED-OUT entries with a one-line
@@ -1022,6 +1038,192 @@ function Push-CertToRemoteStore {
 }
 
 # ---------------------------------------------------------------------
+# EXCHANGE BIND (stage 2 of the mail path) - runs from THIS orchestrator.
+#
+# Called by an Exchange CertHosts entry's Deploy hook AFTER
+# Push-CertToRemoteStore has verified the new cert + key in the Exchange
+# server's LocalMachine\My, and only when the entry has ExchangeBind=$true.
+#
+#   1. Revocation pre-check ON the Exchange server (WinRM). Builds the
+#      chain with online revocation. If the server cannot fetch the CA's
+#      CRL (e.g. a firewall captive portal intercepting plain-HTTP egress)
+#      Exchange would mark the cert RevocationCheckFailure - so we THROW
+#      and bind nothing (fail closed).
+#   2. Idempotence: TLS-probe 443 and 25/STARTTLS from here. If both
+#      already serve the new thumbprint, done.
+#   3. Enable-ExchangeCertificate -Thumbprint -Services IIS,SMTP via the
+#      Exchange remote endpoint (http://<server>/PowerShell/, Kerberos).
+#      NOT the snap-in: that needs a local logon (double-hop).
+#   4. Verify by probing again. Exchange remote PowerShell DROPS the
+#      Services property, so the wire is the only honest check anyway.
+#
+# Also re-pins each listed receive connector's TlsCertificateName to THIS
+# cert's real issuer+subject. Default Frontend's Fqdn cannot be changed to
+# the public name while AuthMechanism includes ExchangeServer, so
+# name-based cert selection is impossible and a pin is required; rebuilding
+# it from the live cert on every bind means a CA intermediate rotation can
+# never leave it stale (stale pin = event 12014, no STARTTLS on port 25).
+# Never touches IIS 444 / 8172, unlisted connectors, or old certs.
+# ---------------------------------------------------------------------
+function Read-SmtpReply([IO.StreamReader]$Reader) {
+    # Multi-line replies use '250-...' until the last line '250 ...'.
+    do { $l = $Reader.ReadLine() } while ($l -and $l.Length -ge 4 -and $l[3] -eq '-')
+    return $l
+}
+
+function Get-ServedThumbprint {
+    param([string]$Server, [int]$Port, [string]$Sni, [switch]$StartTls)
+    $tcp = [Net.Sockets.TcpClient]::new()
+    try {
+        $iar = $tcp.BeginConnect($Server, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne(15000)) { throw "connect to ${Server}:$Port timed out" }
+        $tcp.EndConnect($iar)
+        $stream = $tcp.GetStream(); $stream.ReadTimeout = 15000; $stream.WriteTimeout = 15000
+        if ($StartTls) {
+            $rd = [IO.StreamReader]::new($stream, [Text.Encoding]::ASCII, $false, 1024, $true)
+            $wr = [IO.StreamWriter]::new($stream, [Text.Encoding]::ASCII, 1024, $true)
+            $wr.NewLine = "`r`n"; $wr.AutoFlush = $true
+            $null = Read-SmtpReply $rd
+            $wr.WriteLine("EHLO $env:COMPUTERNAME"); $null = Read-SmtpReply $rd
+            $wr.WriteLine('STARTTLS'); $r = Read-SmtpReply $rd
+            if ($r -notmatch '^220') { throw "STARTTLS refused on ${Server}:$Port - '$r'" }
+        }
+        $ssl = [Net.Security.SslStream]::new($stream, $false, { $true })
+        $ssl.AuthenticateAsClient($Sni)
+        # Read RemoteCertificate here; assigning from inside the validation
+        # callback does not propagate (separate runspace).
+        $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($ssl.RemoteCertificate)
+        $ssl.Dispose()
+        return $cert.Thumbprint
+    } finally { $tcp.Dispose() }
+}
+
+function Invoke-ExchangeBind {
+    param(
+        # Exchange server FQDN (WinRM + remote PowerShell endpoint).
+        [Parameter(Mandatory)][string]$Target,
+        [Parameter(Mandatory)][string]$Thumbprint,
+        [Parameter(Mandatory)][string]$Sni,
+        [Parameter(Mandatory)][string[]]$VaultSecretNames,
+        # Receive connectors (names only, no 'SERVER\' prefix) to re-pin.
+        # Default: 'Default Frontend <SERVER>'. List EVERY FrontendTransport
+        # connector bound to :25 - a custom connector with internal
+        # RemoteIPRanges (e.g. an internal relay connector) wins for internal
+        # senders, including this orchestrator's own port-25 probe. Left
+        # unpinned it serves the self-signed server cert and verification
+        # fails falsely.
+        [string[]]$ReceiveConnector
+    )
+    $serverName = $Target.Split('.')[0]
+    if (-not $ReceiveConnector) { $ReceiveConnector = @("Default Frontend $($serverName.ToUpper())") }
+
+    $cred = $null
+    foreach ($n in $VaultSecretNames) {
+        try { $cred = Get-Secret -Name $n -ErrorAction Stop } catch { continue }
+        if ($cred -is [pscredential]) { break } else { $cred = $null }
+    }
+    if (-not $cred) { throw "No PSCredential for $Target in the vault (tried: $($VaultSecretNames -join ', ')). It must be a DOMAIN account in Organization Management." }
+
+    # --- 1. revocation pre-check, evaluated BY the Exchange server (its egress, not ours) ---
+    $rev = Invoke-Command -ComputerName $Target -Credential $cred -ArgumentList $Thumbprint -ErrorAction Stop -ScriptBlock {
+        param($t)
+        $c  = Get-Item "Cert:\LocalMachine\My\$t" -ErrorAction Stop
+        $ch = New-Object Security.Cryptography.X509Certificates.X509Chain $true
+        $ch.ChainPolicy.RevocationMode      = 'Online'
+        $ch.ChainPolicy.RevocationFlag      = 'EntireChain'
+        $ch.ChainPolicy.UrlRetrievalTimeout = [timespan]::FromSeconds(30)
+        $ok = $ch.Build($c)
+        [pscustomobject]@{
+            Ok      = $ok
+            Status  = (@($ch.ChainStatus | ForEach-Object { "$($_.Status): $($_.StatusInformation.Trim())" }) -join '; ')
+            Issuer  = $c.Issuer
+            Subject = $c.Subject
+        }
+    }
+    if (-not $rev.Ok) {
+        throw "Revocation pre-check FAILED on $Target for $Thumbprint - NOT binding (Exchange would mark it RevocationCheckFailure). Chain: $($rev.Status). Usual cause: plain-HTTP egress to the CA's CRL host (e.g. *.lencr.org) blocked or intercepted by a captive portal."
+    }
+    Log "  $Target : revocation pre-check OK for $Thumbprint"
+
+    # --- 2. already served on the wire? ---
+    $probe = {
+        $r = @{}
+        foreach ($p in @(@{ Port = 443; Tls = $false }, @{ Port = 25; Tls = $true })) {
+            try   { $r[$p.Port] = Get-ServedThumbprint -Server $Target -Port $p.Port -Sni $Sni -StartTls:$p.Tls }
+            catch { $r[$p.Port] = "ERROR: $($_.Exception.Message)" }
+        }
+        $r
+    }
+    $before = & $probe
+    Log "  $Target : serving before bind - 443=$($before[443])  25=$($before[25])"
+    if ($before[443] -eq $Thumbprint -and $before[25] -eq $Thumbprint) {
+        Log "  $Target : already serving $Thumbprint on 443 and 25 - no bind needed."
+        return
+    }
+
+    # --- 3. bind via the Exchange remote endpoint ---
+    $ex = $null
+    $mod = $null
+    try {
+        $ex = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri "http://$Target/PowerShell/" `
+                -Authentication Kerberos -Credential $cred -ErrorAction Stop
+        $mod = Import-PSSession $ex -CommandName Enable-ExchangeCertificate, Get-ReceiveConnector, Set-ReceiveConnector `
+                -Prefix AcmeEx -DisableNameChecking -AllowClobber -ErrorAction Stop
+        Log "  $Target : Enable-ExchangeCertificate -Thumbprint $Thumbprint -Services IIS,SMTP (previous on 443: $($before[443]))"
+        Enable-AcmeExExchangeCertificate -Server $serverName -Thumbprint $Thumbprint -Services 'IIS,SMTP' -Force -ErrorAction Stop
+
+        # RE-PIN port 25. Default Frontend carries AuthMechanism ExchangeServer,
+        # so its Fqdn MUST stay the server name (Set-ReceiveConnector -Fqdn
+        # <public name> is refused - InvalidFqdnUnderExchangeServerAuth) and
+        # name-based selection cannot be used. The pin is therefore rebuilt
+        # from THIS cert's real issuer on every bind, so a CA intermediate
+        # rotation can never leave it stale.
+        $pin  = "<I>$($rev.Issuer)<S>$($rev.Subject)"
+        $repinned = $false
+        foreach ($rc in $ReceiveConnector) {
+            $conn = "$serverName\$rc"
+            $old  = (Get-AcmeExReceiveConnector $conn -ErrorAction Stop).TlsCertificateName
+            if ("$old" -eq $pin) { continue }
+            Log "  $Target : re-pinning '$conn' TlsCertificateName: '$old' -> '$pin'"
+            # Save the old pin ON the Exchange server before changing it - rollback value.
+            Invoke-Command -ComputerName $Target -Credential $cred -ArgumentList $conn, "$old" -ScriptBlock {
+                param($c, $o)
+                New-Item -ItemType Directory -Path C:\Temp -Force | Out-Null
+                Add-Content -Path C:\Temp\rc-pin-history.txt -Value "$(Get-Date -Format s)  [$c]  $o"
+            }
+            Set-AcmeExReceiveConnector $conn -TlsCertificateName $pin -ErrorAction Stop
+            $repinned = $true
+        }
+        if ($repinned) {
+            # Make port 25 pick the new pin now instead of "within minutes".
+            Invoke-Command -ComputerName $Target -Credential $cred -ScriptBlock {
+                Restart-Service MSExchangeFrontEndTransport -ErrorAction Stop
+            }
+            Log "  $Target : MSExchangeFrontEndTransport restarted; old pin(s) saved to C:\Temp\rc-pin-history.txt"
+        }
+    } finally {
+        if ($mod) { Remove-Module $mod -ErrorAction SilentlyContinue }
+        if ($ex)  { Remove-PSSession $ex -ErrorAction SilentlyContinue }
+    }
+
+    # --- 4. verify on the wire (IIS rebind can take a few seconds) ---
+    $after = $null
+    foreach ($i in 1..6) {
+        Start-Sleep -Seconds 10
+        $after = & $probe
+        if ($after[443] -eq $Thumbprint -and $after[25] -eq $Thumbprint) { break }
+    }
+    Log "  $Target : serving after bind - 443=$($after[443])  25=$($after[25])"
+    $bad = @()
+    if ($after[443] -ne $Thumbprint) { $bad += "443 serves $($after[443])" }
+    if ($after[25]  -ne $Thumbprint) { $bad += "25/STARTTLS serves $($after[25]) (every :25 receive connector pinned? FrontEndTransport may need a restart)" }
+    if ($bad) {
+        throw "Bound $Thumbprint on $Target but verification failed: $($bad -join '; '). Rollback: Enable-ExchangeCertificate -Thumbprint $($before[443]) -Services IIS,SMTP -Force"
+    }
+    Log "  $Target : VERIFIED $Thumbprint served on 443 and 25/STARTTLS."
+}
+
+# ---------------------------------------------------------------------
 # THE CERTIFICATE INVENTORY - one entry per host this orchestrator owns.
 # Lives in CertHosts.ps1 NEXT TO THIS SCRIPT (copy CertHosts.example.ps1
 # and edit). Dot-sourced here so the runner itself never needs editing.
@@ -1037,6 +1239,11 @@ function Push-CertToRemoteStore {
 #   Hold          set to a reason to list the host WITHOUT issuing it.
 #   PushTarget /  for remote store pushes: the WinRM target and the vault
 #   PushSecrets   secret name(s) holding a PSCredential for it.
+#   ExchangeBind  (Exchange only) $true = after the push, Invoke-ExchangeBind
+#                 enables the cert for IIS,SMTP and re-pins the receive
+#                 connectors. Leave $false until the first bind is proven.
+#   ExchangeConnectors  (optional) receive connector names to re-pin.
+#                 Default: 'Default Frontend <SERVER>' (short name).
 # ---------------------------------------------------------------------
 $CertHosts = $null
 $inventoryFile = Join-Path $PSScriptRoot 'CertHosts.ps1'
@@ -1356,6 +1563,12 @@ try {
                         $todo += @{ Entry = $entry; Why = 'order valid but no cert on disk - reissuing'; Force = $true }
                     } elseif ([datetime]$crt.NotAfter -le $now) {
                         $todo += @{ Entry = $entry; Why = "cert expired $($crt.NotAfter) - reissuing"; Force = $true }
+                    } elseif (Compare-Object @($crt.AllSANs | ForEach-Object { $_.ToLower() } | Sort-Object -Unique) `
+                                            @($entry.Names | ForEach-Object { $_.ToLower() } | Sort-Object -Unique)) {
+                        # SAN list in CertHosts changed since issuance. Submit-Renewal
+                        # renews the OLD name set forever, so reissue with the new one.
+                        # (Without this check a SAN edit silently never takes effect.)
+                        $todo += @{ Entry = $entry; Why = "SAN mismatch - cert has [$($crt.AllSANs -join ', ')], CertHosts wants [$($entry.Names -join ', ')] - reissuing"; Force = $true }
                     }
                     # otherwise: healthy cert - Submit-Renewal owns it from here.
                 }
@@ -1495,6 +1708,12 @@ try {
     # STAGE 2 - RENEW everything already inside its renewal window
     # -----------------------------------------------------------------
     $renewed = @()
+    # -WhatIfIssue is a PREVIEW: never renew (a renewal would deploy, which
+    # for Exchange means a bind, connector re-pin and transport restart).
+    if ($WhatIfIssue -and -not $SkipRenew) {
+        Log 'Skipping Submit-Renewal (-WhatIfIssue is preview-only)'
+        $SkipRenew = $true
+    }
     if ($SkipRenew) {
         Log 'Skipping Submit-Renewal (-SkipRenew)'
     } else {
